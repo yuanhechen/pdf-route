@@ -33,9 +33,11 @@ classify（分类）
 
 | 依赖 | 必需性 | 安装 |
 |---|---|---|
-| poppler-utils | 渲染扫描页必需 | `sudo apt install poppler-utils` / `brew install poppler` |
-| pdf-inspector | 可选（提取质量更好） | `python3 -m pip install --user pdf-inspector` |
+| poppler-utils | 必需（渲染扫描页） | `sudo apt install poppler-utils` / `brew install poppler` |
+| pdf-inspector | 必需（核心检测能力） | `python3 -m pip install --user pdf-inspector` |
 | Python ≥3.8 | 必需 | — |
+
+> pdf-inspector 缺失时脚本会降级 pdftotext 继续运行，但会**失去乱码文本层检测与混合型识别**——文本层损坏的 PDF 会被误当文字型提取出乱码。务必安装。
 
 ## License
 

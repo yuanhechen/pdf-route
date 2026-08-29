@@ -57,4 +57,4 @@ ${CLAUDE_SKILL_DIR}/scripts/render.sh "$ARGUMENTS" --pages 1-3
 
 ## 依赖缺失时
 
-脚本会自检依赖并在输出里给出降级或安装指引：文字提取首选 pdf-inspector（上面第一步的 pip 命令；报 externally-managed-environment 就加 `--break-system-packages`），装不上自动降级 pdftotext（纯文本无结构但内容全）；渲染需要 poppler-utils（`sudo apt install poppler-utils` / `brew install poppler`）。按输出提示处理即可，不要自行改装。
+脚本会自检依赖并在输出里给出降级或安装指引：文字提取首选 pdf-inspector（上面第一步的 pip 命令；报 externally-managed-environment 就加 `--break-system-packages`），装不上自动降级 pdftotext——降级会失去乱码文本层检测与混合型识别，若提取结果出现大面积生僻乱字，视为文本层损坏，改走路径 B 渲染复核；渲染需要 poppler-utils（`sudo apt install poppler-utils` / `brew install poppler`）。按输出提示处理即可，不要自行改装。
