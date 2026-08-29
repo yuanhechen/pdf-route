@@ -1,0 +1,6 @@
+# 评测用例含本地路径与内部项目名，不随仓库分发（需要时 git add -f evals/）
+evals/
+
+# Python
+__pycache__/
+*.pyc
