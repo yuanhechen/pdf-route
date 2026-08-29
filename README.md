@@ -7,7 +7,7 @@ PDF 读取路由 skill：把「读 PDF」这件事从模型的猜测变成确定
 ## 安装
 
 ```bash
-npx skills add yuanhechen/pdf-route -g
+npx skills add https://github.com/yuanhechen/pdf-route -g
 ```
 
 ## 它解决什么问题
