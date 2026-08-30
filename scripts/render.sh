@@ -30,21 +30,23 @@ if ! command -v pdftoppm >/dev/null 2>&1; then
   exit 1
 fi
 
-file="$(readlink -f "$file")"
+# 绝对路径化用 python3 realpath（本 skill 硬依赖）——GNU readlink -f 在 macOS 不存在
+file="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$file")"
 # || true 防 set -euo pipefail 在 pdfinfo 失败（损坏/加密）时静默退出——统一走下方校验
 total=$(pdfinfo "$file" 2>/dev/null | awk '/^Pages:/{print $2}' || true)
 if ! [[ "$total" =~ ^[0-9]+$ ]]; then
   echo "无法解析 PDF（可能损坏或加密）: $file" >&2
   exit 1
 fi
-hash=$(sha256sum "$file" | cut -c1-12)
+# sha256: GNU coreutils 的 sha256sum 优先，macOS 用自带的 shasum -a 256 兜底
+hash=$({ sha256sum "$file" 2>/dev/null || shasum -a 256 "$file"; } | cut -c1-12)
 
 # scope 子目录：basename 可辨认 + 完整路径 6 位 hash 防同名目录冲突。
 # 用 pwd -P（物理路径）与 pdf.py 的 os.getcwd() 对齐，经符号链接进入时也一致。
 root="${TMPDIR:-/tmp}/leow3bot-pdf"
 phys="$(pwd -P)"
 scope="$(basename "$phys")"; scope="${scope:0:32}"
-outdir="$root/${scope}-$(printf '%s' "$phys" | sha256sum | cut -c1-6)"
+outdir="$root/${scope}-$(printf '%s' "$phys" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-6)"
 mkdir -p -m 700 "$root" "$outdir" 2>/dev/null || mkdir -p "$root" "$outdir"
 chmod 700 "$root" "$outdir" 2>/dev/null || true
 
