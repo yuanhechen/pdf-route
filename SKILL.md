@@ -21,21 +21,17 @@ python3 -c "import pdf_inspector" 2>/dev/null || python3 -m pip install --user p
 python3 ${CLAUDE_SKILL_DIR}/scripts/pdf.py classify "$ARGUMENTS"
 ```
 
-分类结果末尾有「建议下一步」，**直接照做即可**——它已经根据文件类型给出了正确的命令。为什么要先分类：约一半 PDF 自带文本层（可直接提取为文本，毫秒级、零损耗），另一半是扫描图片（只能视觉阅读），两者处理路径完全不同，猜错的代价是浪费一整轮工具调用。
+分类结果末尾有「建议下一步」，**直接照做即可**——它已经根据逐页检测结果给出了正确的命令；文字型/混合型还会**顺手完成提取**，直接给出可 read 的 markdown 路径（无需再跑 extract）。为什么要先分类：约一半 PDF 自带文本层（可直接提取为文本，毫秒级、零损耗），另一半是扫描图片（只能视觉阅读），两者处理路径完全不同，猜错的代价是浪费一整轮工具调用。分类与提取走同一逐页检测，不依赖整本文档级判定——后者会把「字少图多」的 PDF（如幻灯片导出）整本误判成扫描件。
 
-## 路径 A：文字型 → 提取 + read
+## 路径 A：文字型 → 直接 read 提取产物
 
-分类建议提取时：
-
-```bash
-python3 ${CLAUDE_SKILL_DIR}/scripts/pdf.py extract "$ARGUMENTS"
-```
-
-产出 markdown 文件并回报路径，用 read 分页读取（offset/limit 续读）。三点注意：
+classify 对文字型已直接产出 markdown（带页标记），照建议 read 即可，用 offset/limit 续读。注意：
 
 - 产物保留页结构：每页以 `<!-- Page N -->` 开头（N = PDF 物理页码）。「第 N 页说了什么」、按页码引用、章节定位都以此为准；`grep -n '<!-- Page' 文件` 可得页→行号映射，再用 offset 定向 read
 - read 的 offset 是 **markdown 行号，不是 PDF 页码**——换算靠 grep 页标记，不要心算
-- 同一 PDF 重复 extract 直接复用已提取的文件（按内容 hash 缓存），不会重复耗时
+- 输出若提示「第 N 页含大图」：图内文字（图表数值、截图内容）是像素，**不在提取结果里**——问题涉及图表/截图内容就渲染该页视觉补看（渲染出的 PNG 同时含原生文字与图内文字）
+- 提取产物被缓存清理后可用 extract 再生（产物路径不变，重复运行均命中缓存，不重复耗时）：
+  `python3 ${CLAUDE_SKILL_DIR}/scripts/pdf.py extract "$ARGUMENTS"`
 
 ## 路径 B：扫描型 → 渲染 + view
 
@@ -54,10 +50,10 @@ ${CLAUDE_SKILL_DIR}/scripts/render.sh "$ARGUMENTS" --pages 1-3
 
 ## 路径 C：混合型
 
-分类显示部分页无文本层时：先 extract——产物是一份覆盖**全部物理页**的 markdown，有效页是正常文本，无文本层页是「（本页无有效文本层…）」占位符，位置即缺口在阅读顺序中的位置（页码不漂移）。缺的页按路径 B 按需渲染补看；占位符只是标记，不代表该页没有内容。
+部分页有文本层、部分页无：classify 已产出一份覆盖**全部物理页**的 markdown，有效页是正常文本，无文本层页是「（本页无有效文本层…）」占位符，位置即缺口在阅读顺序中的位置（页码不漂移）。照建议先 read 有效页文本，再按需渲染缺页补看（路径 B 的用法与防幻觉要求同样适用）；占位符只是标记，不代表该页没有内容。
 
 ## 依赖与报错
 
-- classify/extract **只走 pdf-inspector，不做降级**：缺失时脚本直接报错并给出安装命令（第一步已自检；pip 报 externally-managed-environment 就加 `--break-system-packages`），装好再跑。不降级的原因：降级会失去乱码文本层检测与混合型逐页识别，恰好重新引入本 skill 要防的「乱码当正文」事故，宁可 fail fast
+- classify/extract **只走 pdf-inspector 的逐页 API（extract_pages_markdown），不做降级**：缺失时脚本直接报错并给出安装命令（第一步已自检；pip 报 externally-managed-environment 就加 `--break-system-packages`）；版本过旧缺该 API 时会给出升级命令。装好再跑。不降级的原因：降级会失去乱码文本层检测与混合型逐页识别，恰好重新引入本 skill 要防的「乱码当正文」事故，宁可 fail fast
 - 渲染扫描页依赖 poppler-utils（`sudo apt install poppler-utils` / `brew install poppler`），页数检测（pdfinfo）同包
 - 损坏/加密 PDF 会在 classify/extract 阶段明确报错——按报错处理（换文件或解密），不要绕路重试
