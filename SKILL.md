@@ -31,9 +31,10 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/pdf.py classify "$ARGUMENTS"
 python3 ${CLAUDE_SKILL_DIR}/scripts/pdf.py extract "$ARGUMENTS"
 ```
 
-产出 markdown 文件并回报路径，用 read 分页读取（offset/limit 续读）。两点注意：
+产出 markdown 文件并回报路径，用 read 分页读取（offset/limit 续读）。三点注意：
 
-- read 的 offset 是 **markdown 行号，不是 PDF 页码**——定位章节靠读内容，不靠换算
+- 产物保留页结构：每页以 `<!-- Page N -->` 开头（N = PDF 物理页码）。「第 N 页说了什么」、按页码引用、章节定位都以此为准；`grep -n '<!-- Page' 文件` 可得页→行号映射，再用 offset 定向 read
+- read 的 offset 是 **markdown 行号，不是 PDF 页码**——换算靠 grep 页标记，不要心算
 - 同一 PDF 重复 extract 直接复用已提取的文件（按内容 hash 缓存），不会重复耗时
 
 ## 路径 B：扫描型 → 渲染 + view
@@ -53,8 +54,10 @@ ${CLAUDE_SKILL_DIR}/scripts/render.sh "$ARGUMENTS" --pages 1-3
 
 ## 路径 C：混合型
 
-分类显示部分页无文本层时：先 extract（有效文本页全部提出），输出里会列出缺失页码，缺的页按路径 B 补看。
+分类显示部分页无文本层时：先 extract——产物是一份覆盖**全部物理页**的 markdown，有效页是正常文本，无文本层页是「（本页无有效文本层…）」占位符，位置即缺口在阅读顺序中的位置（页码不漂移）。缺的页按路径 B 按需渲染补看；占位符只是标记，不代表该页没有内容。
 
-## 依赖缺失时
+## 依赖与报错
 
-脚本会自检依赖并在输出里给出降级或安装指引：文字提取首选 pdf-inspector（上面第一步的 pip 命令；报 externally-managed-environment 就加 `--break-system-packages`），装不上自动降级 pdftotext——降级会失去乱码文本层检测与混合型识别，若提取结果出现大面积生僻乱字，视为文本层损坏，改走路径 B 渲染复核；渲染需要 poppler-utils（`sudo apt install poppler-utils` / `brew install poppler`）。按输出提示处理即可，不要自行改装。
+- classify/extract **只走 pdf-inspector，不做降级**：缺失时脚本直接报错并给出安装命令（第一步已自检；pip 报 externally-managed-environment 就加 `--break-system-packages`），装好再跑。不降级的原因：降级会失去乱码文本层检测与混合型逐页识别，恰好重新引入本 skill 要防的「乱码当正文」事故，宁可 fail fast
+- 渲染扫描页依赖 poppler-utils（`sudo apt install poppler-utils` / `brew install poppler`），页数检测（pdfinfo）同包
+- 损坏/加密 PDF 会在 classify/extract 阶段明确报错——按报错处理（换文件或解密），不要绕路重试
