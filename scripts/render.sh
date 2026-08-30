@@ -73,8 +73,12 @@ if [[ -z "$pages" ]]; then
 fi
 
 rendered=()
-# 清掉上次中途失败可能残留的 tmp 产物，防止下方 ls 误取旧页当成本页
-rm -f -- "$outdir/${hash}-tmp"*.png 2>/dev/null || true
+# tmp 前缀带 PID：同一 PDF 并发渲染（模型并行调用/重试）时两进程 hash 相同，
+# 共享前缀会互删互抢对方的 tmp 文件——稍慢的一方全页失败；带 PID 后各自独立。
+# 最终都 mv 到相同的 pNNN.png，rename 覆盖幂等且内容一致，无碍
+tmp="${hash}-tmp$$"
+# 清掉本进程 PID 前缀残留 + 旧版（无 PID）前缀的陈旧 tmp，防止下方 ls 误取旧页当成本页
+rm -f -- "$outdir/$tmp"*.png "$outdir/${hash}-tmp-"*.png 2>/dev/null || true
 for p in $(expand_pages "$pages"); do
   # 钳制页码范围，防模型传 0/负数/超界
   if ! [[ "$p" =~ ^[0-9]+$ ]]; then
@@ -86,14 +90,21 @@ for p in $(expand_pages "$pages"); do
     echo "跳过无效页码: $p（共 $total 页）" >&2
     continue
   fi
+  # 单页渲染 + 捕获 stderr（2>&1 >/dev/null：只留 stderr 进 err）。
   # || true 防 set -euo pipefail 在单页渲染失败（该页对象损坏等）时静默退出整个脚本
   # ——落到下方统一报「第 N 页渲染失败」并继续渲染其余页
-  pdftoppm -r "$dpi" -png -f "$p" -l "$p" "$file" "$outdir/${hash}-tmp" >/dev/null 2>&1 || true
+  err=$(pdftoppm -r "$dpi" -png -f "$p" -l "$p" "$file" "$outdir/$tmp" 2>&1 >/dev/null) || true
   # pdftoppm 输出带总页数宽度的后缀（如 -tmp-01.png），统一重命名为 p001 风格
   # || true 同上：渲染失败时 glob 无匹配，ls 退出码 2 会经 pipefail 杀掉赋值语句，
   # 必须放行才能落到下方的「第 N 页渲染失败」分支
-  tmpfile=$(ls "$outdir/${hash}-tmp"*.png 2>/dev/null | head -1 || true)
-  [[ -z "$tmpfile" ]] && { echo "第 $p 页渲染失败" >&2; continue; }
+  tmpfile=$(ls "$outdir/$tmp"*.png 2>/dev/null | head -1 || true)
+  if [[ -z "$tmpfile" ]]; then
+    # 重试 1 次抵御偶发读失败（WSL drvfs 瞬断、杀软扫描锁文件等），仍失败才报错
+    err=$(pdftoppm -r "$dpi" -png -f "$p" -l "$p" "$file" "$outdir/$tmp" 2>&1 >/dev/null) || true
+    tmpfile=$(ls "$outdir/$tmp"*.png 2>/dev/null | head -1 || true)
+  fi
+  # 带上 pdftoppm 原始报错（压成单行），否则故障无从定位
+  [[ -z "$tmpfile" ]] && { echo "第 $p 页渲染失败${err:+（pdftoppm: ${err//$'\n'/；}）}" >&2; continue; }
   dst="$outdir/${hash}-p$(printf '%03d' "$p").png"
   mv -f "$tmpfile" "$dst"
   rendered+=("$dst")
