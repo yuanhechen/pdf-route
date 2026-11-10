@@ -20,19 +20,21 @@
 #
 # classify 顺手预热缓存：文字型/混合型检测完直接把 md 落盘，建议下一步从「先
 # extract 再 read」缩短为「直接 read」；对同一文件，classify/extract 全流程只做
-# 一次逐页解析（再次 classify / 后续 extract 均缓存命中）。
+# 一次逐页解析（再次 classify / 后续 extract 均缓存命中）。缓存同时存一份元数据
+# （页构成/多栏页/大图页），命中时连 pdfimages + pdfinfo 逐页面积检测也一并省掉。
 #
 # 含图提示：图片里的文字（图表数值、截图内容）是像素，不在任何文本提取结果里。
 # 对「有文本层但页面上有大图」的页用 pdfimages 检测并提示——模型据此决定是否渲染
 # 该页视觉补看（渲染出的 PNG 同时含原生文字与图内文字）。
 #
-# 输出布局: ${TMPDIR}/leow3bot-pdf/<工作目录scope>/<内容hash>-pg.md——scope 为工作
-# 目录 basename + 完整路径 6 位 hash（与 render.sh 规则一致）：不同项目互不混放、
-# 可整目录手动清理；7 天未动的陈旧产物在每次运行时自动 GC。
+# 输出布局: ${TMPDIR}/leow3bot-pdf/<工作目录scope>/<内容hash>-pg.md（+ 同名 .json
+# 元数据）——scope 为工作目录 basename + 完整路径 6 位 hash（与 render.sh 规则一致）：
+# 不同项目互不混放、可整目录手动清理；7 天未动的陈旧产物在每次运行时自动 GC。
 
 from __future__ import annotations  # 兼容 Python ≤3.9：延迟求值注解（str | None 等 3.10+ 语法）
 
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -44,6 +46,8 @@ from pathlib import Path
 
 ROOT = Path(os.environ.get('TMPDIR', '/tmp')) / 'leow3bot-pdf'
 SCRIPT_DIR = Path(__file__).resolve().parent
+RENDER = shlex.quote(str(SCRIPT_DIR / 'render.sh'))  # 建议命令里的脚本路径也须安全引用（安装目录可能含空格）
+CACHE_VERSION = 1
 GC_MAX_AGE_DAYS = 7
 IMG_AREA_RATIO = 0.15  # 图像显示面积占页面比例 ≥ 此值视为「大图」（半页图/截图级；小 logo 不触发）
 
@@ -62,7 +66,10 @@ def scope_dir() -> Path:
 
 
 def gc_stale() -> None:
-    """老化 GC：删 7 天未动的陈旧文件，移除清空后的 scope 目录。幂等，谁先跑谁清。"""
+    """老化 GC：删 7 天未动的陈旧文件，再移除同样闲置 7 天的空目录。
+
+    空目录也要看 mtime 才删：并发的 classify/extract 可能刚建好 scope 目录、
+    仍在解析尚未落盘，无差别 rmdir 会把对方的目标目录提前删掉。幂等，谁先跑谁清。"""
     now = time.time()
     try:
         entries = list(ROOT.rglob('*'))
@@ -77,7 +84,8 @@ def gc_stale() -> None:
     # 深度优先删空目录（rmdir 仅对空目录成功，非空抛 OSError 被吞）
     for d in sorted((p for p in entries if p.is_dir()), key=lambda x: len(x.parts), reverse=True):
         try:
-            d.rmdir()
+            if now - d.stat().st_mtime > GC_MAX_AGE_DAYS * 86400:
+                d.rmdir()
         except OSError:
             pass
 
@@ -92,6 +100,110 @@ def ensure_dirs() -> Path:
         except OSError:
             pass
     return d
+
+
+def write_atomic(path: Path, text: str) -> None:
+    """原子替换写：临时文件写完再 os.replace——崩溃或并发下不会留下半截缓存。
+
+    父目录在这里再建一次：GC 可能删掉刚建好但尚未落盘的空 scope 目录。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    try:
+        tmp.write_text(text, encoding='utf-8')
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def meta_path(out_path: Path) -> Path:
+    return out_path.with_name(f'{out_path.stem}.json')
+
+
+def read_meta(out_path: Path) -> dict | None:
+    try:
+        return json.loads(meta_path(out_path).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+
+
+def clean_pages(value, total: int) -> list:
+    """JSON 元数据页码 → 合法、去重、升序的 1 基页码；非法条目直接丢弃。"""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for x in value:
+        try:
+            n = int(x)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= n <= total:
+            out.append(n)
+    return sorted(set(out))
+
+
+def valid_page_set(valid: list, ocr: list, total: int) -> bool:
+    """valid/ocr 必须恰好覆盖 1..total，且至少一个有效页（否则不是可复用缓存）。"""
+    try:
+        vs = [int(x) for x in valid]
+        os_ = [int(x) for x in ocr]
+    except (TypeError, ValueError):
+        return False
+    return bool(vs) and sorted(vs + os_) == all_pages(total)
+
+
+def write_cache(out_path: Path, md: str, total: int, valid: list, ocr: list,
+                layout_pages: list, img_pages: list) -> bool:
+    """落盘 md + 分类元数据：缓存命中时无需再跑 pdf-inspector/pdfimages/pdfinfo。
+
+    先写 md 再写元数据；两者都原子替换。md 落盘失败返回 False（后续 read 建议没有
+    意义，调用方应报错退出）；元数据失败只告警——md 仍可读，下次重新解析即可。"""
+    meta = {
+        'version': CACHE_VERSION,
+        'total': total,
+        'valid': sorted(valid),
+        'ocr': sorted(ocr),
+        'layout_pages': sorted(layout_pages),
+        'img_pages': sorted(img_pages),
+        'md_sha256': hashlib.sha256(md.encode('utf-8')).hexdigest(),
+    }
+    try:
+        write_atomic(out_path, md)
+    except OSError as e:
+        print(f'无法写入提取产物 {out_path}: {e}', file=sys.stderr)
+        return False
+    try:
+        write_atomic(meta_path(out_path), json.dumps(meta, ensure_ascii=False))
+    except OSError as e:
+        print(f'警告: 缓存元数据写入失败（md 已生成，下次会重新解析）: {e}', file=sys.stderr)
+    return True
+
+
+def load_cache(out_path: Path, total: int):
+    """读缓存；返回 dict(md, valid, ocr, layout_pages, img_pages)。
+
+    元数据必须齐全且与 md 内容 hash 一致：页结构、多栏页、大图页全部复用，
+    零外部解析。缺元数据（旧版缓存）或内容对不上都返回 None，调用方重新解析，
+    避免用「能还原页结构但提示页未知」的半套缓存悄悄丢掉多栏/大图提示。"""
+    meta = read_meta(out_path)
+    if not isinstance(meta, dict):
+        return None  # 先看元数据：旧版缓存不必白读整份 md
+    try:
+        md = out_path.read_text(encoding='utf-8')
+    except OSError:
+        return None
+    if (meta.get('version') != CACHE_VERSION or meta.get('total') != total
+            or meta.get('md_sha256') != hashlib.sha256(md.encode('utf-8')).hexdigest()):
+        return None
+    valid = clean_pages(meta.get('valid'), total)
+    ocr = clean_pages(meta.get('ocr'), total)
+    if not valid_page_set(valid, ocr, total):
+        return None
+    return {'md': md, 'valid': valid, 'ocr': ocr,
+            'layout_pages': clean_pages(meta.get('layout_pages'), total),
+            'img_pages': clean_pages(meta.get('img_pages'), total)}
 
 
 def file_digest(path: str) -> str:
@@ -166,14 +278,31 @@ def fmt_pages(pages: list, total: int) -> str:
     return f'第 {",".join(map(str, pages))} 页'
 
 
-def suggest_scan(file: str) -> list:
-    return ['建议下一步（按扫描件处理）:',
-            f'  bash {SCRIPT_DIR}/render.sh {q(file)} --pages 1-3',
-            '  然后用 view 逐张查看 PNG（先看目录/首页定位，勿全量翻页）']
-
-
 def all_pages(total: int) -> list:
     return list(range(1, total + 1))
+
+
+def page_selector(pages: list, max_tokens: int = 24) -> tuple:
+    """页码列表 → (render.sh 可用的紧凑范围, 未列出的页数)。
+
+    连续页合并成 a-b；render.sh 不支持省略号，页数太多时只列前 max_tokens 段，
+    剩余页数交回调用方提示，避免命令静默漏页或输出过长。"""
+    runs = []
+    for p in sorted(set(pages)):
+        if runs and p == runs[-1][1] + 1:
+            runs[-1][1] = p
+        else:
+            runs.append([p, p])
+    selector = ','.join(str(a) if a == b else f'{a}-{b}' for a, b in runs[:max_tokens])
+    remaining = sum(b - a + 1 for a, b in runs[max_tokens:])
+    return selector, remaining
+
+
+def suggest_scan(file: str, total: int) -> list:
+    first, _ = page_selector(all_pages(total)[:3])
+    return ['建议下一步（按扫描件处理）:',
+            f'  bash {RENDER} {q(file)} --pages {first}',
+            '  然后用 view 逐张查看 PNG（先看目录/首页定位，勿全量翻页）']
 
 
 # ---------------------------------------------------------------------------
@@ -224,15 +353,6 @@ def layout_pages_of(pe) -> list:
                    *(getattr(pe, 'pages_with_tables', None) or [])})
 
 
-def recover_from_cache(cached: str, total: int):
-    """从缓存 md 还原 (有效页, 无文本层页)；页标记与总页数不符视为脏缓存返回 None。"""
-    markers = [int(m) for m in re.findall(r'<!-- Page (\d+) -->', cached)]
-    if sorted(markers) != all_pages(total):
-        return None
-    ocr = {int(m) for m in re.findall(r'<!-- Page (\d+) -->\n' + re.escape(PAGE_NO_TEXT), cached)}
-    return [p for p in markers if p not in ocr], sorted(ocr)
-
-
 def page_areas(file: str, total: int) -> dict:
     """每页面积（点²）。pdfinfo -f/-l 逐页输出 size 行，混合尺寸文档也正确。"""
     out = run(['pdfinfo', '-f', '1', '-l', str(total), file])
@@ -277,14 +397,22 @@ def big_image_pages(file: str, total: int, candidate_pages: list) -> list:
     return sorted(hits)
 
 
-def emit_page_hints(file: str, total: int, valid: list, layout_pages: list) -> None:
-    """有文本层页的两条补充提示（classify 预提取与 extract 都要打，谁在打谁负责）。"""
-    img_pages = big_image_pages(file, total, valid)
+def emit_page_hints(file: str, total: int, valid: list, layout_pages: list,
+                    img_pages: list | None = None) -> list:
+    """有文本层页的两条补充提示（classify 预提取与 extract 都要打，谁在打谁负责）。
+
+    img_pages 传入缓存/已算好的结果时不再跑 pdfimages；None 表示未知、需现算。"""
+    if img_pages is None:
+        img_pages = big_image_pages(file, total, valid)
     if img_pages:
         print(f'提示: {fmt_pages(img_pages, total)}有文本层但含大图——图内文字（图表数值/截图内容）不在提取结果中，涉及时渲染该页:')
-        print(f'  bash {SCRIPT_DIR}/render.sh {q(file)} --pages {",".join(map(str, img_pages[:6]))}')
+        selector, remaining = page_selector(img_pages)
+        print(f'  bash {RENDER} {q(file)} --pages {selector}')
+        if remaining:
+            print(f'  （另有 {remaining} 页含大图未列出，按需同样渲染）')
     if layout_pages:
         print(f'提示: {fmt_pages(layout_pages, total)}为多栏/表格布局，若提取文本的阅读顺序可疑，渲染该页复核')
+    return img_pages
 
 
 # ---------------------------------------------------------------------------
@@ -294,15 +422,13 @@ def emit_page_hints(file: str, total: int, valid: list, layout_pages: list) -> N
 
 def do_classify(file: str, size: int, total: int, out_path: Path) -> None:
     t0 = time.time()
-    md_text, valid, ocr, layout_pages, reasons = None, None, None, [], set()
-    note = ''
-    if out_path.exists():
-        cached = out_path.read_text(encoding='utf-8')
-        got = recover_from_cache(cached, total)
-        if got is not None:
-            md_text, valid, ocr = cached, got[0], got[1]
-            note = '（缓存命中，零解析复用）'
-    if valid is None:
+    reasons = set()
+    cache = load_cache(out_path, total)
+    if cache:
+        md_text, valid, ocr = cache['md'], cache['valid'], cache['ocr']
+        layout_pages, img_pages = cache['layout_pages'], cache['img_pages']
+        note = '（缓存命中，零 PDF 解析）'
+    else:
         pi = require_pages_api()
         try:
             pe = pi.extract_pages_markdown(file)
@@ -312,9 +438,11 @@ def do_classify(file: str, size: int, total: int, out_path: Path) -> None:
         md_text, valid, ocr = join_paged(pe)
         layout_pages = layout_pages_of(pe)
         reasons = ocr_reasons(pe, ocr)
+        img_pages = big_image_pages(file, total, valid) if valid else []
         note = f'（pdf-inspector 逐页检测，{int((time.time() - t0) * 1000)}ms）'
-        if valid:
-            out_path.write_text(md_text, encoding='utf-8')  # 预热缓存：后续 extract 必命中
+        # 预热缓存：md + 分类/提示元数据一次落盘，后续 extract/classify 均零解析命中
+        if valid and not write_cache(out_path, md_text, total, valid, ocr, layout_pages, img_pages):
+            sys.exit(1)
 
     lines = [f'文件: {file}（{fmt_mb(size)}，{total} 页）']
     if valid and not ocr:
@@ -330,32 +458,37 @@ def do_classify(file: str, size: int, total: int, out_path: Path) -> None:
         lines.append(f'已提取: {out_path}（共 {n_lines} 行，{len(md_text)} 字符；无文本层页为占位符，位置即阅读顺序）')
         lines.append('建议下一步（混合型）:')
         lines.append(f'  1. read(path="{out_path}") 读有效页文本（页结构同上，grep 页标记可定向跳页）')
-        lines.append(f'  2. 缺页按需渲染: bash {SCRIPT_DIR}/render.sh {q(file)} --pages {",".join(map(str, ocr[:4]))}')
+        selector, remaining = page_selector(ocr)
+        lines.append(f'  2. 缺页按需渲染: bash {RENDER} {q(file)} --pages {selector}')
+        if remaining:
+            lines.append(f'     （另有 {remaining} 页未列出，按需同样渲染）')
     else:
         reason_s = f'，原因: {",".join(sorted(reasons))}' if reasons else ''
         lines.append(f'类型: 扫描型——{total} 页全部无有效文本层{reason_s}{note}')
-        lines.extend(suggest_scan(file))
+        lines.extend(suggest_scan(file, total))
     print('\n'.join(lines))
     if valid:
-        emit_page_hints(file, total, valid, layout_pages)
+        emit_page_hints(file, total, valid, layout_pages, img_pages)
         print(f'再生: 该文件被清理后重新运行本命令或 pdf.py extract 即可（自动重新提取）')
 
 
 def do_extract(file: str, total: int, out_path: Path) -> None:
     # 缓存先行：命中则零解析直接返回——逐页解析只在 miss 时发生
-    if out_path.exists():
-        cached = out_path.read_text(encoding='utf-8')
+    cache = load_cache(out_path, total)
+    if cache:
+        cached, valid, ocr = cache['md'], cache['valid'], cache['ocr']
+        layout_pages, img_pages = cache['layout_pages'], cache['img_pages']
         n_lines = cached.count(chr(10)) + 1
-        print(f'已提取: {out_path}（共 {n_lines} 行，{len(cached)} 字符，{total} 页）（缓存命中，零解析复用）')
+        print(f'已提取: {out_path}（共 {n_lines} 行，{len(cached)} 字符，{total} 页）（缓存命中，零 PDF 解析）')
         print(f'读取: read(path="{out_path}")，用 offset/limit 分页（offset 是 markdown 行号）')
         print(f'页结构: 每页以 <!-- Page N --> 开头（N=PDF 物理页码）；grep -n "<!-- Page" 该文件可得页→行号映射')
-        got = recover_from_cache(cached, total)
-        # 占位符页码从缓存内容还原，混合型缓存命中也能看到缺页指引
-        ocr_cached = got[1] if got else [int(m) for m in re.findall(r'<!-- Page (\d+) -->\n' + re.escape(PAGE_NO_TEXT), cached)]
-        valid_cached = got[0] if got else []
-        emit_page_hints(file, total, valid_cached, [])
-        if ocr_cached:
-            print(f'无文本层页: {fmt_pages(ocr_cached, total)}——md 中为占位符，需内容时用 render.sh 渲染')
+        emit_page_hints(file, total, valid, layout_pages, img_pages)
+        if ocr:
+            print(f'无文本层页: {fmt_pages(ocr, total)}——md 中为占位符，需内容时用 render.sh 渲染:')
+            selector, remaining = page_selector(ocr)
+            print(f'  bash {RENDER} {q(file)} --pages {selector}')
+            if remaining:
+                print(f'  （另有 {remaining} 页未列出，按需同样渲染）')
         print('再生: 该文件被清理后重新运行本命令即可（自动重新提取）')
         return
 
@@ -371,18 +504,23 @@ def do_extract(file: str, total: int, out_path: Path) -> None:
         # 零有效页 = 无文本层（纯扫描件 / 乱码层），等价扫描件路径。统一在此
         # 拦截——否则会把只有占位符的 .md 落盘，模型误读为"该 PDF 没内容"。
         print(f'该 PDF 无有效文本层（{fmt_pages(ocr or all_pages(total), total)}），无法提取文字。')
-        print('\n'.join(suggest_scan(file)))
+        print('\n'.join(suggest_scan(file, total)))
         return
 
-    out_path.write_text(markdown, encoding='utf-8')
+    img_pages = big_image_pages(file, total, valid)
+    if not write_cache(out_path, markdown, total, valid, ocr, layout_pages, img_pages):
+        sys.exit(1)
     n_lines = markdown.count('\n') + 1
     print(f'已提取: {out_path}（共 {n_lines} 行，{len(markdown)} 字符，{total} 页中 {len(valid)} 页有效）')
     print(f'读取: read(path="{out_path}")，用 offset/limit 分页（offset 是 markdown 行号）')
     print(f'页结构: 每页以 <!-- Page N --> 开头（N=PDF 物理页码），按页定位/引用；grep -n "<!-- Page" 该文件可得页→行号映射')
-    emit_page_hints(file, total, valid, layout_pages)
+    emit_page_hints(file, total, valid, layout_pages, img_pages)
     if ocr:
         print(f'无文本层页: {fmt_pages(ocr, total)}——md 中已留占位符（位置即阅读顺序），需内容时渲染:')
-        print(f'  bash {SCRIPT_DIR}/render.sh {q(file)} --pages {",".join(map(str, ocr[:6]))}')
+        selector, remaining = page_selector(ocr)
+        print(f'  bash {RENDER} {q(file)} --pages {selector}')
+        if remaining:
+            print(f'  （另有 {remaining} 页未列出，按需同样渲染）')
     print('再生: 该文件被清理后重新运行本命令即可（自动重新提取）')
 
 
@@ -398,7 +536,7 @@ def main() -> None:
     file = os.path.abspath(raw)
     size = os.path.getsize(file)
     total = pdf_pages(file)
-    if total is None:
+    if total is None or total < 1:
         # 区分「依赖缺失」与「文件本身问题」，报错才可行动
         if shutil.which('pdfinfo') is None:
             print('缺少依赖 poppler-utils（pdfinfo，页数检测需要）。安装:\n'
