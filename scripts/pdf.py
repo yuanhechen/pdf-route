@@ -427,7 +427,7 @@ def do_classify(file: str, size: int, total: int, out_path: Path) -> None:
     if cache:
         md_text, valid, ocr = cache['md'], cache['valid'], cache['ocr']
         layout_pages, img_pages = cache['layout_pages'], cache['img_pages']
-        note = '（缓存命中，零解析复用）'
+        note = '（缓存命中，零 PDF 解析）'
     else:
         pi = require_pages_api()
         try:
@@ -479,7 +479,7 @@ def do_extract(file: str, total: int, out_path: Path) -> None:
         cached, valid, ocr = cache['md'], cache['valid'], cache['ocr']
         layout_pages, img_pages = cache['layout_pages'], cache['img_pages']
         n_lines = cached.count(chr(10)) + 1
-        print(f'已提取: {out_path}（共 {n_lines} 行，{len(cached)} 字符，{total} 页）（缓存命中，零解析复用）')
+        print(f'已提取: {out_path}（共 {n_lines} 行，{len(cached)} 字符，{total} 页）（缓存命中，零 PDF 解析）')
         print(f'读取: read(path="{out_path}")，用 offset/limit 分页（offset 是 markdown 行号）')
         print(f'页结构: 每页以 <!-- Page N --> 开头（N=PDF 物理页码）；grep -n "<!-- Page" 该文件可得页→行号映射')
         emit_page_hints(file, total, valid, layout_pages, img_pages)
